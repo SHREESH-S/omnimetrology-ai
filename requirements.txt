@@ -2,3 +2,4 @@ streamlit
 requests
 beautifulsoup4
 easyocr
+reportlab
