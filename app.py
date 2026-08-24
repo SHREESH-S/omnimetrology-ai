@@ -92,7 +92,7 @@ def get_db_logs():
 
 @st.cache_resource
 def load_ocr():
-    return easyocr.Reader(['en'], gpu=False)
+    return easyocr.Reader(['en'], gpu=False, verbose=False)
 
 reader = load_ocr()
 
