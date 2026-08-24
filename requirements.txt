@@ -1,4 +1,6 @@
 streamlit
+requests
+beautifulsoup4
 easyocr
 opencv-python-headless
 numpy
@@ -6,4 +8,5 @@ pandas
 Pillow
 scikit-image
 reportlab
-beautifulsoup4
+torch
+torchvision
