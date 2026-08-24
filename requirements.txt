@@ -3,5 +3,4 @@ requests
 beautifulsoup4
 easyocr
 reportlab
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.7.1+cpu
+torch==2.7.1
