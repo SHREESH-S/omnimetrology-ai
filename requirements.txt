@@ -1,10 +1,10 @@
 streamlit
-torch
-torchvision
 easyocr
 opencv-python-headless
-pandas
 numpy
-pillow
-beautifulsoup4
+pandas
+Pillow
+scikit-image
 reportlab
+torch==2.8.0
+torchvision==0.23.0
