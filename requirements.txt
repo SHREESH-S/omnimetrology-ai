@@ -7,3 +7,4 @@ pandas
 numpy
 pillow
 beautifulsoup4
+reportlab
