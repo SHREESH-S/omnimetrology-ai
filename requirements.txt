@@ -1,6 +1,8 @@
 streamlit
-requests
-beautifulsoup4
+torch
+torchvision
 easyocr
-reportlab
-torch==2.7.1
+opencv-python-headless
+pandas
+numpy
+pillow
