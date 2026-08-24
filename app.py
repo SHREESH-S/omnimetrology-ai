@@ -3,7 +3,6 @@ import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 import re
-import easyocr
 from PIL import Image, ImageDraw
 import numpy as np
 import pandas as pd
@@ -90,11 +89,6 @@ def get_db_logs():
     conn.close()
     return df
 
-@st.cache_resource
-def load_ocr():
-    return easyocr.Reader(['en'], gpu=False, verbose=False)
-
-reader = load_ocr()
 
 # =========================================================================================
 # PREMIUM "GOVERNMENT + APPLE" LIGHT THEME — high-contrast, dark readable typography
