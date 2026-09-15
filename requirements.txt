@@ -1,4 +1,3 @@
---extra-index-url https://download.pytorch.org/whl/cpu
 streamlit>=1.38
 requests
 beautifulsoup4
@@ -8,8 +7,6 @@ pandas
 Pillow
 scikit-image
 reportlab
-easyocr
-torch
-torchvision
+pytesseract
 SpeechRecognition
-anthropic
+gTTS
