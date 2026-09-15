@@ -3,9 +3,7 @@ import requests
 from bs4 import BeautifulSoup
 import re
 from PIL import Image, ImageDraw
-import numpy as np
 import pandas as pd
-import cv2
 import sqlite3
 import datetime
 import io
@@ -402,9 +400,18 @@ def resolve_officer(text, source_type="physical", selected_zone="North Zone (Del
 # Requires a system package: see packages.txt (tesseract-ocr) alongside requirements.txt.
 # =========================================================================================
 def enhance_and_annotate_image(pil_img_or_file):
+    """
+    Pure-PIL + Tesseract pipeline. Deliberately avoids OpenCV/numpy entirely for this
+    step: no cv2 import, no full-resolution numpy arrays, no CLAHE/denoise/sharpen
+    passes each holding their own full-size copy in memory. Tesseract works perfectly
+    well on a modestly-sized, lightly-contrast-enhanced PIL image, and this whole
+    pipeline now peaks at roughly ONE small image in memory at a time instead of 6-7
+    full-resolution copies, which is what was crashing the 1GB Streamlit Cloud instance.
+    """
     import pytesseract
     import shutil
     import gc
+    from PIL import ImageOps, ImageFilter
 
     tess_path = shutil.which("tesseract")
     if tess_path:
@@ -418,60 +425,31 @@ def enhance_and_annotate_image(pil_img_or_file):
             "app -> Reboot), not just rerun it."
         )
 
-    # ---- Memory guard, done properly ------------------------------------------------
-    # A file's size on disk (MB) is its COMPRESSED size. Once decoded into pixels, a
-    # "3MB" 4000x3000 phone photo becomes ~36MB of raw RGB data, and this pipeline used
-    # to keep 6-7 full-resolution copies alive at once (gray, CLAHE, blurred, sharpened,
-    # RGB, annotated) = 200MB+ spikes, easily enough to OOM-kill a 1GB server regardless
-    # of the original file's MB size. Two fixes:
-    #   1) Use JPEG's own "draft mode" to decode directly at a lower resolution instead
-    #      of decoding full-size and THEN shrinking — this avoids the big spike entirely.
-    #   2) Explicitly delete + garbage-collect each intermediate array once we're done
-    #      with it, instead of letting 6 full copies pile up in memory at once.
-    MAX_DIM = 1000
+    MAX_DIM = 1000  # plenty for OCR on packaging text; keeps memory tiny regardless of upload size
 
     if hasattr(pil_img_or_file, "seek"):
         pil_img_or_file.seek(0)
-    gc.collect()  # clear anything left over from a previous run before we start a new one
-    pil_img = Image.open(pil_img_or_file)
+    gc.collect()
 
+    pil_img = Image.open(pil_img_or_file)
     try:
-        pil_img.draft("RGB", (MAX_DIM, MAX_DIM))  # cheap, JPEG-only fast downscale-on-decode
+        pil_img.draft("RGB", (MAX_DIM, MAX_DIM))  # JPEG: decode small directly, skips the big spike
     except Exception:
-        pass  # PNG etc. don't support draft mode — falls through to normal decode + resize
+        pass
 
     pil_img = pil_img.convert("RGB")
-    w, h = pil_img.size
-    if max(w, h) > MAX_DIM:
-        scale = MAX_DIM / max(w, h)
-        pil_img = pil_img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    pil_img.thumbnail((MAX_DIM, MAX_DIM), Image.LANCZOS)  # in-place, no extra full-size copy
 
-    img_np = np.array(pil_img)
-    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    # Lightweight contrast + sharpen using PIL only (no OpenCV, no numpy arrays)
+    gray = ImageOps.grayscale(pil_img)
+    gray = ImageOps.autocontrast(gray, cutoff=1)
+    gray = gray.filter(ImageFilter.SHARPEN)
 
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    enhanced_gray = clahe.apply(gray)
+    data = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT)
     del gray
     gc.collect()
 
-    denoised = cv2.GaussianBlur(enhanced_gray, (3, 3), 0)
-    del enhanced_gray
-    gc.collect()
-
-    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-    sharpened = cv2.filter2D(denoised, -1, kernel)
-    del denoised
-    gc.collect()
-
-    processed_rgb = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2RGB)
-    del sharpened
-    gc.collect()
-
-    data = pytesseract.image_to_data(processed_rgb, output_type=pytesseract.Output.DICT)
-    del processed_rgb
-    gc.collect()
-
-    draw_img = Image.fromarray(img_np.copy())
+    draw_img = pil_img.copy()
     draw = ImageDraw.Draw(draw_img)
     full_text = []
 
