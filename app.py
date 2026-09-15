@@ -1,4 +1,3 @@
-
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
@@ -10,6 +9,7 @@ import cv2
 import sqlite3
 import datetime
 import io
+import json
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
@@ -22,6 +22,123 @@ st.set_page_config(
     page_icon="⚖️",
     initial_sidebar_state="expanded"
 )
+
+# =========================================================================================
+# OPTIONAL LLM CLIENT (activates automatically if you add an API key to Streamlit secrets)
+# -----------------------------------------------------------------------------------------
+# To enable the real conversational AI assistant, add ONE of these to
+# .streamlit/secrets.toml (locally) or the "Secrets" panel on Streamlit Cloud:
+#
+#   ANTHROPIC_API_KEY = "sk-ant-..."
+#
+# Nothing else in the app needs to change — it will detect the key and switch the
+# AI Assistant tab from rule-based mode to full LLM mode automatically.
+# =========================================================================================
+def get_llm_client():
+    api_key = st.secrets.get("ANTHROPIC_API_KEY", None) if hasattr(st, "secrets") else None
+    if not api_key:
+        return None
+    try:
+        import anthropic
+        return anthropic.Anthropic(api_key=api_key)
+    except Exception:
+        return None
+
+LLM_CLIENT = get_llm_client()
+LLM_ENABLED = LLM_CLIENT is not None
+
+def ask_llm(user_question, context_dict=None):
+    """Send a question + current audit context to Claude. Falls back to None on any failure."""
+    if not LLM_ENABLED:
+        return None
+    try:
+        context_str = json.dumps(context_dict, default=str, indent=2) if context_dict else "No active audit context."
+        system_prompt = (
+            "You are the OmniMetrology AI Assistant embedded in a Legal Metrology enforcement "
+            "portal for India. Answer questions about the Legal Metrology (Packaged Commodities) "
+            "Rules, 2011, about the current product audit context provided, and about how to use "
+            "this portal. Be concise, factual, and cite the relevant rule number when possible. "
+            "If you are unsure of a specific legal detail, say so rather than guessing.\n\n"
+            f"Current audit context:\n{context_str}"
+        )
+        response = LLM_CLIENT.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=600,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_question}]
+        )
+        return "".join(block.text for block in response.content if block.type == "text")
+    except Exception as e:
+        return f"⚠️ LLM request failed: {e}"
+
+# =========================================================================================
+# RULE-BASED ASSISTANT (works with zero API keys, zero cost, zero setup)
+# =========================================================================================
+RULE_BASED_KB = [
+    (["mrp", "maximum retail price"],
+     "Under Rule 6 of the Legal Metrology (Packaged Commodities) Rules, 2011, every pre-packaged "
+     "commodity must declare the Maximum Retail Price inclusive of all taxes, in the format "
+     "'MRP Rs. ___ (inclusive of all taxes)'."),
+    (["net quantity", "net qty", "net weight"],
+     "Net quantity must be declared in standard units (grams/kilograms for solids, "
+     "millilitres/litres for liquids) in a specific font size proportional to the package's "
+     "principal display area, per Rule 6 and the Second Schedule."),
+    (["unit sale price", "usp"],
+     "The Unit Sale Price (price per standard unit, e.g., price per kg or per litre) must be "
+     "declared so consumers can compare value across pack sizes, under Rule 6(1)(f)."),
+    (["manufacturer", "packer", "marketed by", "mfd by"],
+     "The name and complete address of the manufacturer, packer, or importer must be declared "
+     "under Rule 6(1)(a)(i). This is where the PIN code declaration is checked in this portal."),
+    (["country of origin", "made in"],
+     "Country of origin must be declared for all imported pre-packaged commodities, and is now "
+     "increasingly required as good practice for domestic goods too, per Rule 6(1)(a) read with "
+     "Legal Metrology Rules & Consumer Protection e-commerce guidelines."),
+    (["expiry", "best before", "mfg date", "manufacturing date"],
+     "Month and year of manufacture/packing and, where applicable, the 'best before' or expiry "
+     "date must be declared under Rule 6(1)(e)."),
+    (["pin code", "pincode", "postal code"],
+     "A valid 6-digit PIN code as part of the manufacturer/packer address is required so "
+     "consumers and enforcement officers can identify the responsible entity's jurisdiction. "
+     "This portal treats a missing or structurally invalid PIN as a standalone 'dual violation' "
+     "in addition to any other missing fields."),
+    (["shrinkflation", "quantity reduced", "less quantity same price"],
+     "Shrinkflation — reducing net quantity while keeping price constant without clear disclosure "
+     "— is scrutinised under fair trade practice provisions. This portal flags it whenever the "
+     "audited net weight is lower than the previously declared net weight for the same product."),
+    (["dual violation"],
+     "A 'Dual Violation' in this portal means the routing engine could not find a valid, "
+     "structurally correct PIN code in the product's declared information. That is flagged as a "
+     "violation of the address-declaration requirement (Rule 6) *independently* of whichever "
+     "other statutory fields (MRP, net quantity, etc.) are missing."),
+    (["how does routing work", "officer routing", "how is the officer assigned"],
+     "The enforcement routing engine works in layers: (1) an exact valid PIN code maps straight "
+     "to the district officer, (2) a structurally valid but unmapped PIN falls back to the "
+     "selected zonal command, (3) a missing/invalid PIN triggers a Dual Violation and the engine "
+     "tries to match a city name in the text, (4) failing that, e-commerce listings route to the "
+     "platform's registered nodal officer, and (5) as a last resort everything routes to the "
+     "default zonal headquarters you picked in the sidebar."),
+    (["compliance score", "how is score calculated"],
+     "The compliance score is the percentage of statutory checks passed out of all checks run "
+     "(MRP, unit sale price, net quantity, manufacturer details, country of origin, expiry/mfg "
+     "date, and — when a routing result is available — valid PIN code declaration)."),
+]
+
+def rule_based_answer(question):
+    q = question.lower()
+    best_match, best_score = None, 0
+    for keywords, answer in RULE_BASED_KB:
+        score = sum(1 for k in keywords if k in q)
+        if score > best_score:
+            best_score, best_match = score, answer
+    if best_match:
+        return best_match
+    return (
+        "I don't have a specific rule matched for that in offline mode. Try asking about MRP, "
+        "net quantity, unit sale price, manufacturer address, country of origin, expiry dates, "
+        "PIN code declaration, shrinkflation, dual violations, or how officer routing works. "
+        "For open-ended questions, enable the LLM assistant by adding an ANTHROPIC_API_KEY to "
+        "your Streamlit secrets."
+    )
 
 # =========================================================================================
 # DATABASE LAYER (with safe migration for the new routing/pincode columns)
@@ -44,7 +161,6 @@ def init_db():
                 )''')
     conn.commit()
 
-    # Safe migration: add new columns if they don't already exist (older DB files)
     new_columns = {
         "pincode": "TEXT",
         "pincode_valid": "TEXT",
@@ -89,9 +205,8 @@ def get_db_logs():
     conn.close()
     return df
 
-
 # =========================================================================================
-# PREMIUM "GOVERNMENT + APPLE" LIGHT THEME — high-contrast, dark readable typography
+# PREMIUM "GOVERNMENT + APPLE" LIGHT THEME
 # =========================================================================================
 st.markdown("""
 <style>
@@ -100,179 +215,89 @@ st.markdown("""
 html, body, [class*="css"]  {
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 }
-
 .stApp {
     background: linear-gradient(180deg, #f7f9fc 0%, #eef1f7 100%);
     color: #0f172a;
 }
-
-/* Top tricolor accent strip — evokes an official Indian Government portal */
 .tricolor-strip {
-    height: 6px;
-    width: 100%;
+    height: 6px; width: 100%;
     background: linear-gradient(90deg, #FF9933 0%, #FF9933 33%, #FFFFFF 33%, #FFFFFF 66%, #138808 66%, #138808 100%);
-    border-radius: 4px;
-    margin-bottom: 18px;
+    border-radius: 4px; margin-bottom: 18px;
 }
-
-/* Header */
 .sih-header {
-    background: #ffffff;
-    border: 1px solid #e2e8f0;
-    border-left: 8px solid #1e3a8a;
-    padding: 28px 32px;
-    border-radius: 18px;
-    margin-bottom: 26px;
+    background: #ffffff; border: 1px solid #e2e8f0; border-left: 8px solid #1e3a8a;
+    padding: 28px 32px; border-radius: 18px; margin-bottom: 26px;
     box-shadow: 0 10px 30px -12px rgba(15, 23, 42, 0.15);
 }
-.sih-title {
-    font-family: 'Poppins', sans-serif;
-    font-size: 2.1rem;
-    font-weight: 800;
-    color: #0f172a;
-    margin: 0;
-    letter-spacing: -0.5px;
-}
-.sih-sub {
-    font-size: 1rem;
-    font-weight: 500;
-    color: #334155;
-    margin-top: 8px;
-}
+.sih-title { font-family: 'Poppins', sans-serif; font-size: 2.1rem; font-weight: 800; color: #0f172a; margin: 0; letter-spacing: -0.5px; }
+.sih-sub { font-size: 1rem; font-weight: 500; color: #334155; margin-top: 8px; }
 .badge-row { margin-top: 14px; }
 .gov-badge {
-    display: inline-block;
-    background: #eff6ff;
-    color: #1e3a8a;
-    border: 1px solid #bfdbfe;
-    font-weight: 700;
-    font-size: 0.78rem;
-    padding: 5px 12px;
-    border-radius: 999px;
-    margin-right: 8px;
+    display: inline-block; background: #eff6ff; color: #1e3a8a; border: 1px solid #bfdbfe;
+    font-weight: 700; font-size: 0.78rem; padding: 5px 12px; border-radius: 999px; margin-right: 8px;
 }
-
-/* Section headers */
-h1, h2, h3, h4 {
-    font-family: 'Poppins', sans-serif;
-    color: #0f172a !important;
-    font-weight: 700 !important;
-}
-p, li, span, label, div {
-    color: #1e293b;
-}
+h1, h2, h3, h4 { font-family: 'Poppins', sans-serif; color: #0f172a !important; font-weight: 700 !important; }
+p, li, span, label, div { color: #1e293b; }
 .stMarkdown, .stText { color: #1e293b !important; }
-
-/* Cards */
 .glass-card {
-    background: #ffffff;
-    border: 1px solid #e2e8f0;
-    border-radius: 16px;
-    padding: 20px 22px;
-    box-shadow: 0 8px 24px -14px rgba(15,23,42,0.18);
-    margin-bottom: 14px;
+    background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 20px 22px;
+    box-shadow: 0 8px 24px -14px rgba(15,23,42,0.18); margin-bottom: 14px;
 }
 .routing-card {
-    background: #f8fafc;
-    border: 1px solid #cbd5e1;
-    border-left: 6px solid #1e3a8a;
-    border-radius: 14px;
-    padding: 18px 20px;
-    margin: 10px 0 16px 0;
+    background: #f8fafc; border: 1px solid #cbd5e1; border-left: 6px solid #1e3a8a;
+    border-radius: 14px; padding: 18px 20px; margin: 10px 0 16px 0;
 }
 .routing-card b { color: #0f172a; }
 .dual-violation-banner {
-    background: #fef2f2;
-    border: 1px solid #fecaca;
-    border-left: 6px solid #dc2626;
-    border-radius: 14px;
-    padding: 16px 20px;
-    color: #991b1b;
-    font-weight: 700;
-    margin-bottom: 14px;
+    background: #fef2f2; border: 1px solid #fecaca; border-left: 6px solid #dc2626;
+    border-radius: 14px; padding: 16px 20px; color: #991b1b; font-weight: 700; margin-bottom: 14px;
 }
 .clean-pin-banner {
-    background: #f0fdf4;
-    border: 1px solid #bbf7d0;
-    border-left: 6px solid #16a34a;
-    border-radius: 14px;
-    padding: 16px 20px;
-    color: #14532d;
-    font-weight: 700;
-    margin-bottom: 14px;
+    background: #f0fdf4; border: 1px solid #bbf7d0; border-left: 6px solid #16a34a;
+    border-radius: 14px; padding: 16px 20px; color: #14532d; font-weight: 700; margin-bottom: 14px;
 }
-
-/* Metric cards */
+.chat-bubble-user {
+    background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 14px 14px 2px 14px;
+    padding: 12px 16px; margin: 6px 0; color: #1e3a8a; font-weight: 600;
+}
+.chat-bubble-ai {
+    background: #ffffff; border: 1px solid #e2e8f0; border-radius: 14px 14px 14px 2px;
+    padding: 12px 16px; margin: 6px 0; color: #1e293b;
+}
+.mode-pill {
+    display: inline-block; font-size: 0.75rem; font-weight: 700; padding: 4px 10px;
+    border-radius: 999px; margin-bottom: 10px;
+}
+.mode-pill-llm { background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; }
+.mode-pill-rule { background: #fffbeb; color: #92400e; border: 1px solid #fde68a; }
 div[data-testid="stMetric"] {
-    background: #ffffff;
-    border: 1px solid #e2e8f0;
-    border-radius: 14px;
-    padding: 14px 16px;
+    background: #ffffff; border: 1px solid #e2e8f0; border-radius: 14px; padding: 14px 16px;
     box-shadow: 0 6px 18px -12px rgba(15,23,42,0.15);
 }
-div[data-testid="stMetricValue"] {
-    font-size: 1.9rem !important;
-    font-weight: 800 !important;
-    color: #1e3a8a !important;
-}
-div[data-testid="stMetricLabel"] {
-    color: #475569 !important;
-    font-weight: 600 !important;
-}
-
-/* Buttons */
+div[data-testid="stMetricValue"] { font-size: 1.9rem !important; font-weight: 800 !important; color: #1e3a8a !important; }
+div[data-testid="stMetricLabel"] { color: #475569 !important; font-weight: 600 !important; }
 .stButton>button {
-    background: linear-gradient(90deg, #1e3a8a 0%, #1d4ed8 100%) !important;
-    color: #ffffff !important;
-    font-weight: 700 !important;
-    border-radius: 10px !important;
-    border: none !important;
-    padding: 12px 26px !important;
-    transition: all 0.2s ease !important;
+    background: linear-gradient(90deg, #1e3a8a 0%, #1d4ed8 100%) !important; color: #ffffff !important;
+    font-weight: 700 !important; border-radius: 10px !important; border: none !important;
+    padding: 12px 26px !important; transition: all 0.2s ease !important;
     box-shadow: 0 6px 18px -6px rgba(29, 78, 216, 0.5) !important;
 }
-.stButton>button:hover {
-    transform: translateY(-1px) !important;
-    box-shadow: 0 10px 22px -6px rgba(29, 78, 216, 0.65) !important;
-}
+.stButton>button:hover { transform: translateY(-1px) !important; box-shadow: 0 10px 22px -6px rgba(29, 78, 216, 0.65) !important; }
 .stDownloadButton>button {
-    background: linear-gradient(90deg, #b91c1c 0%, #dc2626 100%) !important;
-    color: #ffffff !important;
-    font-weight: 700 !important;
-    border-radius: 10px !important;
-    border: none !important;
+    background: linear-gradient(90deg, #b91c1c 0%, #dc2626 100%) !important; color: #ffffff !important;
+    font-weight: 700 !important; border-radius: 10px !important; border: none !important;
 }
-
-/* Tabs */
-.stTabs [data-baseweb="tab"] {
-    font-weight: 700;
-    color: #334155;
-}
-.stTabs [aria-selected="true"] {
-    color: #1e3a8a !important;
-    border-bottom-color: #1e3a8a !important;
-}
-
-/* Sidebar */
-section[data-testid="stSidebar"] {
-    background: #0f172a;
-}
-section[data-testid="stSidebar"] * {
-    color: #f1f5f9 !important;
-}
-section[data-testid="stSidebar"] input, section[data-testid="stSidebar"] select {
-    color: #0f172a !important;
-}
-
-/* Dataframe */
+.stTabs [data-baseweb="tab"] { font-weight: 700; color: #334155; }
+.stTabs [aria-selected="true"] { color: #1e3a8a !important; border-bottom-color: #1e3a8a !important; }
+section[data-testid="stSidebar"] { background: #0f172a; }
+section[data-testid="stSidebar"] * { color: #f1f5f9 !important; }
+section[data-testid="stSidebar"] input, section[data-testid="stSidebar"] select { color: #0f172a !important; }
 [data-testid="stDataFrame"] { border-radius: 12px; overflow: hidden; }
 </style>
 """, unsafe_allow_html=True)
 
 # =========================================================================================
 # PIN-CODE → DISTRICT / OFFICER ROUTING ENGINE
-# (Prototype sample data set for demo purposes — a production deployment would call the
-#  official India Post PIN-Directory service for full 6-digit coverage.)
 # =========================================================================================
 PIN_DISTRICT_MAP = {
     "636": {"district": "Salem",           "state": "Tamil Nadu",     "zone": "South Zone (Bengaluru)",  "officer_name": "Insp. R. Kumar",        "officer_phone": "+914272212345"},
@@ -296,8 +321,6 @@ PIN_DISTRICT_MAP = {
     "462": {"district": "Bhopal",          "state": "Madhya Pradesh", "zone": "Central Zone",            "officer_name": "Insp. M. Verma",        "officer_phone": "+917552345678"},
     "492": {"district": "Raipur",          "state": "Chhattisgarh",   "zone": "Central Zone",            "officer_name": "Insp. S. Sahu",         "officer_phone": "+917712345678"},
 }
-
-# Fallback: recognizable city/district names mentioned in free text (used when the PIN is missing/invalid)
 CITY_FALLBACK_MAP = {
     "salem": "636", "chennai": "600", "bengaluru": "560", "bangalore": "560",
     "kochi": "682", "ernakulam": "682", "hyderabad": "500", "delhi": "110",
@@ -306,8 +329,6 @@ CITY_FALLBACK_MAP = {
     "bhubaneswar": "751", "guwahati": "781", "patna": "800", "indore": "452",
     "bhopal": "462", "raipur": "492",
 }
-
-# Fallback: registered nodal grievance contact per e-commerce platform
 PLATFORM_HQ_MAP = {
     "amazon":    {"officer_name": "Nodal Officer — Amazon India HQ",    "officer_phone": "+911800120000", "district": "Amazon India Registered HQ"},
     "flipkart":  {"officer_name": "Nodal Officer — Flipkart HQ",        "officer_phone": "+918049049049", "district": "Flipkart Registered HQ"},
@@ -316,8 +337,6 @@ PLATFORM_HQ_MAP = {
     "myntra":    {"officer_name": "Nodal Officer — Myntra HQ",          "officer_phone": "+918067128000", "district": "Myntra Registered HQ"},
     "meesho":    {"officer_name": "Nodal Officer — Meesho HQ",          "officer_phone": "+918069999000", "district": "Meesho Registered HQ"},
 }
-
-# Last-resort fallback: zonal command center (matches the sidebar's Officer Dispatch Control)
 ZONE_HQ_MAP = {
     "North Zone (Delhi)":      {"officer_name": "North Zone Central Command",   "officer_phone": "+911123000000"},
     "West Zone (Mumbai)":      {"officer_name": "West Zone Central Command",    "officer_phone": "+912223000000"},
@@ -327,24 +346,15 @@ ZONE_HQ_MAP = {
 }
 
 def _is_valid_pincode(pin):
-    """Structural validation: 6 digits, valid Indian first-digit range (1-8), not a placeholder like 000000/999999."""
     if not re.fullmatch(r"\d{6}", pin):
         return False
     if pin[0] not in "12345678":
         return False
-    if len(set(pin)) == 1:  # e.g. 111111, 999999 — clearly fake
+    if len(set(pin)) == 1:
         return False
     return True
 
 def resolve_officer(text, source_type="physical", selected_zone="North Zone (Delhi)"):
-    """
-    Multi-layered fallback routing pipeline:
-      1) Valid + mapped PIN code           -> exact district officer
-      2) Valid PIN, unmapped prefix        -> flagged as 'format valid but unmapped', zonal fallback
-      3) Missing/invalid PIN               -> DUAL VIOLATION flag + try city-name text match
-      4) No city match + e-commerce source -> route to platform nodal HQ
-      5) Nothing resolvable                -> default zonal headquarters
-    """
     text_l = text.lower()
     candidates = re.findall(r"\b\d{6}\b", text)
     valid_pins = [p for p in candidates if _is_valid_pincode(p)]
@@ -358,7 +368,6 @@ def resolve_officer(text, source_type="physical", selected_zone="North Zone (Del
         "officer_name": None, "officer_phone": None,
     }
 
-    # Layer 1 & 2: valid PIN code found
     if valid_pins:
         prefix = valid_pins[0][:3]
         if prefix in PIN_DISTRICT_MAP:
@@ -373,10 +382,8 @@ def resolve_officer(text, source_type="physical", selected_zone="North Zone (Del
             result.update(ZONE_HQ_MAP.get(selected_zone, ZONE_HQ_MAP["North Zone (Delhi)"]))
             return result
 
-    # No valid PIN => this is itself a statutory violation
     result["dual_violation"] = True
 
-    # Layer 3: city/district keyword fallback
     for city, prefix in CITY_FALLBACK_MAP.items():
         if city in text_l:
             info = PIN_DISTRICT_MAP[prefix]
@@ -384,7 +391,6 @@ def resolve_officer(text, source_type="physical", selected_zone="North Zone (Del
             result["routing_method"] = "CITY_NAME_TEXT_FALLBACK"
             return result
 
-    # Layer 4: e-commerce platform nodal HQ fallback
     if source_type in ("web", "ecommerce", "bulk"):
         for platform, info in PLATFORM_HQ_MAP.items():
             if platform in text_l:
@@ -393,7 +399,6 @@ def resolve_officer(text, source_type="physical", selected_zone="North Zone (Del
                 result["routing_method"] = "PLATFORM_HQ_FALLBACK"
                 return result
 
-    # Layer 5: default zonal headquarters
     result.update(ZONE_HQ_MAP.get(selected_zone, ZONE_HQ_MAP["North Zone (Delhi)"]))
     result["district"] = "Unresolved — Manual Review"
     result["zone"] = selected_zone
@@ -401,9 +406,21 @@ def resolve_officer(text, source_type="physical", selected_zone="North Zone (Del
     return result
 
 # =========================================================================================
-# COMPUTER VISION ENGINE
+# COMPUTER VISION / OCR ENGINE  (fixed: reader is now properly created and cached)
 # =========================================================================================
+@st.cache_resource(show_spinner="Loading OCR engine (first run only, ~30-60s)...")
+def get_ocr_reader():
+    """
+    Lazily creates and caches a single EasyOCR reader for the lifetime of the app process.
+    This is exactly what was missing before — 'reader' was referenced but never defined,
+    which is what threw the NameError.
+    """
+    import easyocr
+    return easyocr.Reader(['en'], gpu=False)
+
 def enhance_and_annotate_image(pil_img):
+    reader = get_ocr_reader()
+
     img_np = np.array(pil_img.convert("RGB"))
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
 
@@ -434,7 +451,7 @@ def enhance_and_annotate_image(pil_img):
     return " ".join(full_text), draw_img
 
 # =========================================================================================
-# METROLOGY RULE ENGINE (7 statutory checks, including address/PIN declaration)
+# METROLOGY RULE ENGINE
 # =========================================================================================
 def audit_legal_metrology(text_data, historical_qty=None, current_qty=None, pincode_valid=None):
     text = text_data.lower()
@@ -464,7 +481,7 @@ def audit_legal_metrology(text_data, historical_qty=None, current_qty=None, pinc
     }
 
 # =========================================================================================
-# PDF PENALTY NOTICE GENERATOR (now includes routing info + dual-violation flag)
+# PDF PENALTY NOTICE GENERATOR
 # =========================================================================================
 def generate_pdf_notice(product_name, vendor, score, missing, routing=None):
     buffer = io.BytesIO()
@@ -580,13 +597,19 @@ officer_phone = st.sidebar.text_input("Manual Override — Officer Mobile:", val
 vendor_email = st.sidebar.text_input("Vendor Legal Contact:", value="legal@vendor-corp.com")
 st.sidebar.markdown("---")
 st.sidebar.caption("📍 District-level routing is automatic: the AI reads the PIN code from the package or listing and dispatches the alert to the local officer — not the whole zone.")
+st.sidebar.markdown("---")
+if LLM_ENABLED:
+    st.sidebar.success("🤖 AI Assistant: LLM mode active")
+else:
+    st.sidebar.warning("🤖 AI Assistant: Rule-based mode\n\nAdd ANTHROPIC_API_KEY to Streamlit secrets to enable full LLM answers.")
 
-tab_dash, tab_web, tab_ocr, tab_fraud, tab_bulk = st.tabs([
+tab_dash, tab_web, tab_ocr, tab_fraud, tab_bulk, tab_ai = st.tabs([
     "📈 Command Center",
     "🌐 E-Commerce Web Audit",
     "📸 Physical Vision OCR",
     "📊 Fraud & Shrinkflation",
-    "📂 Bulk CSV Inventory"
+    "📂 Bulk CSV Inventory",
+    "🤖 AI Assistant"
 ])
 
 # --- TAB 1: COMMAND CENTER ---
@@ -630,7 +653,8 @@ with tab_web:
 
     if st.button("Run Web Audit"):
         if target_url:
-            scraped = scrape_url(target_url)
+            with st.spinner("Fetching and analysing listing..."):
+                scraped = scrape_url(target_url)
             if scraped["status"]:
                 routing = resolve_officer(scraped["text"] + " " + target_url, source_type="web", selected_zone=officer_region)
                 audit = audit_legal_metrology(scraped["text"], pincode_valid=routing["pincode_valid"])
@@ -643,6 +667,11 @@ with tab_web:
                                  district=routing["district"], officer_name=routing["officer_name"],
                                  officer_phone=routing["officer_phone"], routing_method=routing["routing_method"],
                                  dual_violation="Yes" if routing["dual_violation"] else "No")
+
+                st.session_state["last_context"] = {
+                    "source": "Web Audit", "product": scraped["title"], "vendor": vendor_name,
+                    "score": audit["compliance_score"], "missing_fields": missing, "routing": routing
+                }
 
                 c1, c2 = st.columns([1, 2])
                 with c1:
@@ -664,15 +693,30 @@ with tab_web:
                     st.download_button("📄 Download Official Legal Penalty Notice (PDF)", pdf, "Penalty_Notice.pdf", "application/pdf")
             else:
                 st.error(f"Could not reach the target URL: {scraped.get('error', 'Unknown error')}")
+        else:
+            st.warning("Please enter a URL first.")
 
 # --- TAB 3: VISION OCR ---
 with tab_ocr:
     st.markdown("### Optical Character Scanning for Physical Packaging")
+    st.caption("First scan after a fresh deploy will take ~30-60s while the OCR model loads. Every scan after that is fast.")
     file = st.file_uploader("Upload Packaging Image:", type=["png", "jpg", "jpeg"])
     pkg_vendor = st.text_input("Manufacturer Name:", value="Local Packager Corp")
 
     if file and st.button("Process Vision Pipeline"):
-        text, annotated_img = enhance_and_annotate_image(Image.open(file))
+        try:
+            with st.spinner("Running OCR + compliance analysis..."):
+                text, annotated_img = enhance_and_annotate_image(Image.open(file))
+        except Exception as e:
+            st.error(
+                "OCR engine failed to run. This is usually because 'easyocr' (and its dependency "
+                "'torch') is missing from requirements.txt, or the deploy ran out of memory while "
+                "downloading the OCR model. See the fix notes below the app for the exact "
+                "requirements.txt needed."
+            )
+            st.exception(e)
+            st.stop()
+
         routing = resolve_officer(text, source_type="physical", selected_zone=officer_region)
         audit = audit_legal_metrology(text, pincode_valid=routing["pincode_valid"])
         missing = [k for k, v in audit["checks"].items() if not v]
@@ -685,6 +729,12 @@ with tab_ocr:
                          officer_phone=routing["officer_phone"], routing_method=routing["routing_method"],
                          dual_violation="Yes" if routing["dual_violation"] else "No")
 
+        st.session_state["last_context"] = {
+            "source": "Vision OCR", "product": file.name, "vendor": pkg_vendor,
+            "score": audit["compliance_score"], "missing_fields": missing, "routing": routing,
+            "ocr_text": text
+        }
+
         c1, c2 = st.columns([1, 2])
         with c1:
             st.image(annotated_img, caption="Green = Verified Declaration | Amber = Standard Ambient Text", use_container_width=True)
@@ -694,6 +744,9 @@ with tab_ocr:
                 st.write(f"{'✅' if v else '❌'} **{k.replace('_', ' ').title()}**")
 
         render_routing_card(routing)
+        with st.expander("🔍 Raw OCR Text Extracted"):
+            st.write(text if text.strip() else "_No text detected — try a clearer, well-lit photo._")
+
         if not audit["is_compliant"]:
             pdf = generate_pdf_notice(file.name, pkg_vendor, audit["compliance_score"], missing, routing=routing)
             st.download_button("📄 Download Official Legal Penalty Notice (PDF)", pdf, "Penalty_Notice.pdf", "application/pdf")
@@ -722,6 +775,10 @@ with tab_fraud:
         else:
             st.success("✅ No quantity-reduction anomalies detected.")
 
+        st.session_state["last_context"] = {
+            "source": "Shrinkflation Scan", "score": audit["compliance_score"],
+            "shrinkflation": audit["shrinkflation"], "routing": routing
+        }
         render_routing_card(routing)
 
 # --- TAB 5: BULK CSV INVENTORY ---
@@ -757,3 +814,86 @@ with tab_bulk:
                 progress.progress((idx + 1) / len(df))
 
             st.dataframe(pd.DataFrame(results), use_container_width=True)
+
+# --- TAB 6: AI ASSISTANT (rule-based now, LLM-ready) ---
+with tab_ai:
+    st.markdown("### 🤖 Ask About Legal Metrology, This Product, or How the Portal Works")
+
+    if LLM_ENABLED:
+        st.markdown('<span class="mode-pill mode-pill-llm">● LLM MODE — powered by Claude</span>', unsafe_allow_html=True)
+    else:
+        st.markdown('<span class="mode-pill mode-pill-rule">● OFFLINE MODE — rule-based knowledge base</span>', unsafe_allow_html=True)
+        st.caption(
+            "To unlock full open-ended answers, add `ANTHROPIC_API_KEY = \"sk-ant-...\"` to your "
+            "Streamlit secrets (Settings → Secrets on Streamlit Cloud, or a local "
+            "`.streamlit/secrets.toml`). No other code changes needed — this tab detects the key "
+            "automatically."
+        )
+
+    ctx = st.session_state.get("last_context")
+    if ctx:
+        with st.expander("📎 Using context from your most recent audit", expanded=False):
+            st.json(ctx)
+    else:
+        st.info("Run an audit in another tab first so the assistant can answer questions about *your* specific product — or just ask a general question below.")
+
+    st.markdown("#### 🎙️ Voice Input (optional, no API key needed)")
+    st.caption(
+        "Record a question with your microphone. Transcription uses Google's free speech "
+        "recognition service via the `SpeechRecognition` library — good for short, clear "
+        "questions, no account required."
+    )
+    audio_value = st.audio_input("Tap to record your question")
+    transcribed_text = ""
+    if audio_value is not None:
+        try:
+            import speech_recognition as sr
+            recognizer = sr.Recognizer()
+            with sr.AudioFile(audio_value) as source:
+                audio_data = recognizer.record(source)
+            transcribed_text = recognizer.recognize_google(audio_data)
+            st.success(f"Heard: \"{transcribed_text}\"")
+        except Exception as e:
+            st.warning(f"Could not transcribe audio automatically ({e}). Please type your question below instead.")
+
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+
+    for role, msg in st.session_state.chat_history:
+        css_class = "chat-bubble-user" if role == "user" else "chat-bubble-ai"
+        label = "🧑 You" if role == "user" else "🤖 Assistant"
+        st.markdown(f'<div class="{css_class}"><b>{label}:</b><br>{msg}</div>', unsafe_allow_html=True)
+
+    user_question = st.text_input("Type your question:", value=transcribed_text, key="ai_question_input")
+    col_ask, col_clear = st.columns([1, 1])
+    with col_ask:
+        ask_clicked = st.button("Ask", use_container_width=True)
+    with col_clear:
+        if st.button("Clear Chat", use_container_width=True):
+            st.session_state.chat_history = []
+            st.rerun()
+
+    if ask_clicked and user_question.strip():
+        st.session_state.chat_history.append(("user", user_question))
+        if LLM_ENABLED:
+            answer = ask_llm(user_question, context_dict=ctx)
+        else:
+            answer = rule_based_answer(user_question)
+        st.session_state.chat_history.append(("assistant", answer))
+        st.rerun()
+
+    st.markdown("---")
+    st.markdown("##### 💡 Try asking:")
+    sample_qs = [
+        "What is a dual violation?",
+        "How does officer routing work?",
+        "What does the compliance score mean?",
+        "What is shrinkflation and how is it detected?",
+    ]
+    cols = st.columns(len(sample_qs))
+    for col, q in zip(cols, sample_qs):
+        if col.button(q, use_container_width=True):
+            st.session_state.chat_history.append(("user", q))
+            answer = ask_llm(q, context_dict=ctx) if LLM_ENABLED else rule_based_answer(q)
+            st.session_state.chat_history.append(("assistant", answer))
+            st.rerun()
