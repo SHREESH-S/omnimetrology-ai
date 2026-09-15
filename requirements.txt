@@ -1,11 +1,9 @@
 streamlit>=1.38
 requests
 beautifulsoup4
-opencv-python-headless
 numpy
 pandas
 Pillow
-scikit-image
 reportlab
 pytesseract
 SpeechRecognition
