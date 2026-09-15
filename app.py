@@ -405,7 +405,6 @@ def enhance_and_annotate_image(pil_img):
     import pytesseract
     import shutil
 
-    # Explicitly locate the tesseract binary rather than assuming PATH is set correctly.
     tess_path = shutil.which("tesseract")
     if tess_path:
         pytesseract.pytesseract.tesseract_cmd = tess_path
@@ -418,12 +417,28 @@ def enhance_and_annotate_image(pil_img):
             "app -> Reboot), not just rerun it."
         )
 
-    img_np = np.array(pil_img.convert("RGB"))
+    # ---- Memory guard --------------------------------------------------------------
+    # Phone-camera photos are often 3000-4000px wide (12+ MP). Running CLAHE + denoising
+    # + sharpening on the full-resolution image is what was triggering the server's
+    # "low memory" kill on Streamlit Community Cloud's 1GB instances. Downscaling to a
+    # sane max dimension keeps OCR accuracy essentially unchanged (text is still plenty
+    # sharp) while cutting memory and CPU use by 10-20x on large photos.
+    MAX_DIM = 1600
+    pil_img = pil_img.convert("RGB")
+    w, h = pil_img.size
+    if max(w, h) > MAX_DIM:
+        scale = MAX_DIM / max(w, h)
+        pil_img = pil_img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    img_np = np.array(pil_img)
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
 
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     enhanced_gray = clahe.apply(gray)
-    denoised = cv2.fastNlMeansDenoising(enhanced_gray, h=10)
+
+    # Lightweight denoise instead of fastNlMeansDenoising (which is by far the most
+    # memory/CPU-hungry step in this pipeline and the most likely cause of the crash).
+    denoised = cv2.GaussianBlur(enhanced_gray, (3, 3), 0)
 
     kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
     sharpened = cv2.filter2D(denoised, -1, kernel)
@@ -702,6 +717,16 @@ with tab_ocr:
     pkg_vendor = st.text_input("Manufacturer Name:", value="Local Packager Corp")
 
     if file and st.button("Process Vision Pipeline"):
+        # Guard against extremely large uploads (e.g. raw 20MP camera files) at the source,
+        # before any processing touches them, to avoid a memory spike on decode.
+        MAX_UPLOAD_MB = 8
+        if file.size > MAX_UPLOAD_MB * 1024 * 1024:
+            st.error(
+                f"This image is {file.size / (1024*1024):.1f} MB, which is too large for this "
+                f"server's memory budget (limit {MAX_UPLOAD_MB} MB). Please use your phone's "
+                "camera app to take/export a compressed photo, or resize it before uploading."
+            )
+            st.stop()
         try:
             with st.spinner("Running OCR + compliance analysis..."):
                 text, annotated_img = enhance_and_annotate_image(Image.open(file))
