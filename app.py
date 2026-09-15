@@ -403,6 +403,20 @@ def resolve_officer(text, source_type="physical", selected_zone="North Zone (Del
 # =========================================================================================
 def enhance_and_annotate_image(pil_img):
     import pytesseract
+    import shutil
+
+    # Explicitly locate the tesseract binary rather than assuming PATH is set correctly.
+    tess_path = shutil.which("tesseract")
+    if tess_path:
+        pytesseract.pytesseract.tesseract_cmd = tess_path
+    else:
+        raise RuntimeError(
+            "TESSERACT_NOT_FOUND: the 'tesseract' binary is not installed on this server. "
+            "This means packages.txt was not picked up — check that packages.txt sits in the "
+            "SAME root folder as app.py and requirements.txt (not in a subfolder), that it "
+            "contains exactly the line 'tesseract-ocr', and then fully reboot the app (Manage "
+            "app -> Reboot), not just rerun it."
+        )
 
     img_np = np.array(pil_img.convert("RGB"))
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
@@ -692,11 +706,12 @@ with tab_ocr:
             with st.spinner("Running OCR + compliance analysis..."):
                 text, annotated_img = enhance_and_annotate_image(Image.open(file))
         except Exception as e:
-            st.error(
-                "OCR engine failed to run. This is usually because 'easyocr' (and its dependency "
-                "'torch') is missing from requirements.txt, or the deploy ran out of memory while "
-                "downloading the OCR model. See the fix notes below the app for the exact "
-                "requirements.txt needed."
+            st.error(f"OCR failed with this exact error: `{e}`")
+            st.caption(
+                "Common causes: (1) packages.txt missing/misplaced/misspelled — must be in the "
+                "repo root as exactly `tesseract-ocr`, then the app needs a full 'Reboot' (not "
+                "just a rerun). (2) The app is still mid-rebuild — wait ~1 min after pushing and "
+                "try again. (3) A memory limit — check Manage app -> logs for 'OOM' or 'Killed'."
             )
             st.exception(e)
             st.stop()
