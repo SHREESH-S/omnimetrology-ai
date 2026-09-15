@@ -428,10 +428,11 @@ def enhance_and_annotate_image(pil_img_or_file):
     #      of decoding full-size and THEN shrinking — this avoids the big spike entirely.
     #   2) Explicitly delete + garbage-collect each intermediate array once we're done
     #      with it, instead of letting 6 full copies pile up in memory at once.
-    MAX_DIM = 1400
+    MAX_DIM = 1000
 
     if hasattr(pil_img_or_file, "seek"):
         pil_img_or_file.seek(0)
+    gc.collect()  # clear anything left over from a previous run before we start a new one
     pil_img = Image.open(pil_img_or_file)
 
     try:
