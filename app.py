@@ -401,9 +401,10 @@ def resolve_officer(text, source_type="physical", selected_zone="North Zone (Del
 # Tesseract has no ML model download and a tiny memory footprint, so it's the right fit here.
 # Requires a system package: see packages.txt (tesseract-ocr) alongside requirements.txt.
 # =========================================================================================
-def enhance_and_annotate_image(pil_img):
+def enhance_and_annotate_image(pil_img_or_file):
     import pytesseract
     import shutil
+    import gc
 
     tess_path = shutil.which("tesseract")
     if tess_path:
@@ -417,13 +418,27 @@ def enhance_and_annotate_image(pil_img):
             "app -> Reboot), not just rerun it."
         )
 
-    # ---- Memory guard --------------------------------------------------------------
-    # Phone-camera photos are often 3000-4000px wide (12+ MP). Running CLAHE + denoising
-    # + sharpening on the full-resolution image is what was triggering the server's
-    # "low memory" kill on Streamlit Community Cloud's 1GB instances. Downscaling to a
-    # sane max dimension keeps OCR accuracy essentially unchanged (text is still plenty
-    # sharp) while cutting memory and CPU use by 10-20x on large photos.
-    MAX_DIM = 1600
+    # ---- Memory guard, done properly ------------------------------------------------
+    # A file's size on disk (MB) is its COMPRESSED size. Once decoded into pixels, a
+    # "3MB" 4000x3000 phone photo becomes ~36MB of raw RGB data, and this pipeline used
+    # to keep 6-7 full-resolution copies alive at once (gray, CLAHE, blurred, sharpened,
+    # RGB, annotated) = 200MB+ spikes, easily enough to OOM-kill a 1GB server regardless
+    # of the original file's MB size. Two fixes:
+    #   1) Use JPEG's own "draft mode" to decode directly at a lower resolution instead
+    #      of decoding full-size and THEN shrinking — this avoids the big spike entirely.
+    #   2) Explicitly delete + garbage-collect each intermediate array once we're done
+    #      with it, instead of letting 6 full copies pile up in memory at once.
+    MAX_DIM = 1400
+
+    if hasattr(pil_img_or_file, "seek"):
+        pil_img_or_file.seek(0)
+    pil_img = Image.open(pil_img_or_file)
+
+    try:
+        pil_img.draft("RGB", (MAX_DIM, MAX_DIM))  # cheap, JPEG-only fast downscale-on-decode
+    except Exception:
+        pass  # PNG etc. don't support draft mode — falls through to normal decode + resize
+
     pil_img = pil_img.convert("RGB")
     w, h = pil_img.size
     if max(w, h) > MAX_DIM:
@@ -435,17 +450,25 @@ def enhance_and_annotate_image(pil_img):
 
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     enhanced_gray = clahe.apply(gray)
+    del gray
+    gc.collect()
 
-    # Lightweight denoise instead of fastNlMeansDenoising (which is by far the most
-    # memory/CPU-hungry step in this pipeline and the most likely cause of the crash).
     denoised = cv2.GaussianBlur(enhanced_gray, (3, 3), 0)
+    del enhanced_gray
+    gc.collect()
 
     kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
     sharpened = cv2.filter2D(denoised, -1, kernel)
+    del denoised
+    gc.collect()
 
     processed_rgb = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2RGB)
+    del sharpened
+    gc.collect()
 
     data = pytesseract.image_to_data(processed_rgb, output_type=pytesseract.Output.DICT)
+    del processed_rgb
+    gc.collect()
 
     draw_img = Image.fromarray(img_np.copy())
     draw = ImageDraw.Draw(draw_img)
@@ -729,7 +752,7 @@ with tab_ocr:
             st.stop()
         try:
             with st.spinner("Running OCR + compliance analysis..."):
-                text, annotated_img = enhance_and_annotate_image(Image.open(file))
+                text, annotated_img = enhance_and_annotate_image(file)
         except Exception as e:
             st.error(f"OCR failed with this exact error: `{e}`")
             st.caption(
