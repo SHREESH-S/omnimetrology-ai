@@ -9,7 +9,6 @@ import cv2
 import sqlite3
 import datetime
 import io
-import json
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
@@ -24,52 +23,10 @@ st.set_page_config(
 )
 
 # =========================================================================================
-# OPTIONAL LLM CLIENT (activates automatically if you add an API key to Streamlit secrets)
-# -----------------------------------------------------------------------------------------
-# To enable the real conversational AI assistant, add ONE of these to
-# .streamlit/secrets.toml (locally) or the "Secrets" panel on Streamlit Cloud:
-#
-#   ANTHROPIC_API_KEY = "sk-ant-..."
-#
-# Nothing else in the app needs to change — it will detect the key and switch the
-# AI Assistant tab from rule-based mode to full LLM mode automatically.
+# OFFLINE AI ASSISTANT — 100% free, no API key, no paid service of any kind.
+# Rule-based keyword matching against a Legal Metrology knowledge base.
 # =========================================================================================
-def get_llm_client():
-    api_key = st.secrets.get("ANTHROPIC_API_KEY", None) if hasattr(st, "secrets") else None
-    if not api_key:
-        return None
-    try:
-        import anthropic
-        return anthropic.Anthropic(api_key=api_key)
-    except Exception:
-        return None
-
-LLM_CLIENT = get_llm_client()
-LLM_ENABLED = LLM_CLIENT is not None
-
-def ask_llm(user_question, context_dict=None):
-    """Send a question + current audit context to Claude. Falls back to None on any failure."""
-    if not LLM_ENABLED:
-        return None
-    try:
-        context_str = json.dumps(context_dict, default=str, indent=2) if context_dict else "No active audit context."
-        system_prompt = (
-            "You are the OmniMetrology AI Assistant embedded in a Legal Metrology enforcement "
-            "portal for India. Answer questions about the Legal Metrology (Packaged Commodities) "
-            "Rules, 2011, about the current product audit context provided, and about how to use "
-            "this portal. Be concise, factual, and cite the relevant rule number when possible. "
-            "If you are unsure of a specific legal detail, say so rather than guessing.\n\n"
-            f"Current audit context:\n{context_str}"
-        )
-        response = LLM_CLIENT.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=600,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_question}]
-        )
-        return "".join(block.text for block in response.content if block.type == "text")
-    except Exception as e:
-        return f"⚠️ LLM request failed: {e}"
+LLM_ENABLED = False
 
 # =========================================================================================
 # RULE-BASED ASSISTANT (works with zero API keys, zero cost, zero setup)
@@ -121,7 +78,36 @@ RULE_BASED_KB = [
      "The compliance score is the percentage of statutory checks passed out of all checks run "
      "(MRP, unit sale price, net quantity, manufacturer details, country of origin, expiry/mfg "
      "date, and — when a routing result is available — valid PIN code declaration)."),
+    (["what can you do", "help", "what is this portal", "who are you"],
+     "I'm the offline OmniMetrology Assistant. I can explain Legal Metrology rules (MRP, net "
+     "quantity, manufacturer address, PIN codes, expiry dates, country of origin), explain "
+     "shrinkflation and dual violations, explain how officer routing works, and answer questions "
+     "about your most recent audit if you've run one in another tab. I run fully offline with no "
+     "external API or cost."),
+    (["penalty", "fine", "punishment", "notice"],
+     "This portal generates a demonstration Legal Metrology penalty notice PDF whenever an audit "
+     "is non-compliant, listing the missing statutory fields and the routed enforcement officer. "
+     "In a real deployment, actual penalty amounts and procedures would follow the Legal "
+     "Metrology Act, 2009 and state-level enforcement rules."),
+    (["e-commerce", "online seller", "amazon", "flipkart", "blinkit"],
+     "For online listings, this portal scrapes the product page text and runs the same statutory "
+     "checks as physical packaging. If no valid PIN code is found in the listing or seller "
+     "address, it falls back to routing the alert to the platform's registered nodal grievance "
+     "officer instead of a specific district."),
 ]
+
+def text_to_speech_bytes(text, lang="en"):
+    """Converts text to spoken audio using gTTS (free, no API key). Returns MP3 bytes or None."""
+    try:
+        from gtts import gTTS
+        clean_text = re.sub(r"[*_#`]", "", text)[:600]  # strip markdown, cap length
+        tts = gTTS(text=clean_text, lang=lang)
+        buf = io.BytesIO()
+        tts.write_to_fp(buf)
+        buf.seek(0)
+        return buf.read()
+    except Exception:
+        return None
 
 def rule_based_answer(question):
     q = question.lower()
@@ -406,20 +392,17 @@ def resolve_officer(text, source_type="physical", selected_zone="North Zone (Del
     return result
 
 # =========================================================================================
-# COMPUTER VISION / OCR ENGINE  (fixed: reader is now properly created and cached)
+# COMPUTER VISION / OCR ENGINE
+# -----------------------------------------------------------------------------------------
+# Uses pytesseract (a thin wrapper around the Tesseract binary) instead of EasyOCR/torch.
+# EasyOCR + torch together need well over 1GB RAM just to load the model, which reliably
+# OOM-kills the process on Streamlit Community Cloud's free tier — that's what was showing
+# up in the browser as a generic "reconnect failed" error (the server crashed mid-request).
+# Tesseract has no ML model download and a tiny memory footprint, so it's the right fit here.
+# Requires a system package: see packages.txt (tesseract-ocr) alongside requirements.txt.
 # =========================================================================================
-@st.cache_resource(show_spinner="Loading OCR engine (first run only, ~30-60s)...")
-def get_ocr_reader():
-    """
-    Lazily creates and caches a single EasyOCR reader for the lifetime of the app process.
-    This is exactly what was missing before — 'reader' was referenced but never defined,
-    which is what threw the NameError.
-    """
-    import easyocr
-    return easyocr.Reader(['en'], gpu=False)
-
 def enhance_and_annotate_image(pil_img):
-    reader = get_ocr_reader()
+    import pytesseract
 
     img_np = np.array(pil_img.convert("RGB"))
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
@@ -432,7 +415,8 @@ def enhance_and_annotate_image(pil_img):
     sharpened = cv2.filter2D(denoised, -1, kernel)
 
     processed_rgb = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2RGB)
-    ocr_results = reader.readtext(processed_rgb)
+
+    data = pytesseract.image_to_data(processed_rgb, output_type=pytesseract.Output.DICT)
 
     draw_img = Image.fromarray(img_np.copy())
     draw = ImageDraw.Draw(draw_img)
@@ -440,13 +424,16 @@ def enhance_and_annotate_image(pil_img):
 
     compliance_keywords = ["mrp", "rs", "₹", "net", "qty", "g", "kg", "ml", "mfd", "exp", "manufactured", "origin", "pin"]
 
-    for bbox, text, prob in ocr_results:
+    n_boxes = len(data["text"])
+    for i in range(n_boxes):
+        text = data["text"][i].strip()
+        conf = int(data["conf"][i]) if str(data["conf"][i]).lstrip("-").isdigit() else -1
+        if not text or conf < 30:
+            continue
         full_text.append(text)
-        (top_left, top_right, bottom_right, bottom_left) = bbox
-        p1 = (int(top_left[0]), int(top_left[1]))
-        p2 = (int(bottom_right[0]), int(bottom_right[1]))
+        x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
         color = "#16a34a" if any(k in text.lower() for k in compliance_keywords) else "#d97706"
-        draw.rectangle([p1, p2], outline=color, width=3)
+        draw.rectangle([x, y, x + w, y + h], outline=color, width=3)
 
     return " ".join(full_text), draw_img
 
@@ -598,10 +585,7 @@ vendor_email = st.sidebar.text_input("Vendor Legal Contact:", value="legal@vendo
 st.sidebar.markdown("---")
 st.sidebar.caption("📍 District-level routing is automatic: the AI reads the PIN code from the package or listing and dispatches the alert to the local officer — not the whole zone.")
 st.sidebar.markdown("---")
-if LLM_ENABLED:
-    st.sidebar.success("🤖 AI Assistant: LLM mode active")
-else:
-    st.sidebar.warning("🤖 AI Assistant: Rule-based mode\n\nAdd ANTHROPIC_API_KEY to Streamlit secrets to enable full LLM answers.")
+st.sidebar.info("🤖 AI Assistant: Offline rule-based mode\n\nNo API key, no cost. Answers Legal Metrology questions and reads them aloud.")
 
 tab_dash, tab_web, tab_ocr, tab_fraud, tab_bulk, tab_ai = st.tabs([
     "📈 Command Center",
@@ -819,16 +803,7 @@ with tab_bulk:
 with tab_ai:
     st.markdown("### 🤖 Ask About Legal Metrology, This Product, or How the Portal Works")
 
-    if LLM_ENABLED:
-        st.markdown('<span class="mode-pill mode-pill-llm">● LLM MODE — powered by Claude</span>', unsafe_allow_html=True)
-    else:
-        st.markdown('<span class="mode-pill mode-pill-rule">● OFFLINE MODE — rule-based knowledge base</span>', unsafe_allow_html=True)
-        st.caption(
-            "To unlock full open-ended answers, add `ANTHROPIC_API_KEY = \"sk-ant-...\"` to your "
-            "Streamlit secrets (Settings → Secrets on Streamlit Cloud, or a local "
-            "`.streamlit/secrets.toml`). No other code changes needed — this tab detects the key "
-            "automatically."
-        )
+    st.markdown('<span class="mode-pill mode-pill-rule">● OFFLINE MODE — free rule-based knowledge base, no API key</span>', unsafe_allow_html=True)
 
     ctx = st.session_state.get("last_context")
     if ctx:
@@ -843,6 +818,8 @@ with tab_ai:
         "recognition service via the `SpeechRecognition` library — good for short, clear "
         "questions, no account required."
     )
+    speak_replies = st.toggle("🔊 Speak answers out loud", value=True)
+
     audio_value = st.audio_input("Tap to record your question")
     transcribed_text = ""
     if audio_value is not None:
@@ -859,10 +836,15 @@ with tab_ai:
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
-    for role, msg in st.session_state.chat_history:
+    for i, (role, msg) in enumerate(st.session_state.chat_history):
         css_class = "chat-bubble-user" if role == "user" else "chat-bubble-ai"
         label = "🧑 You" if role == "user" else "🤖 Assistant"
         st.markdown(f'<div class="{css_class}"><b>{label}:</b><br>{msg}</div>', unsafe_allow_html=True)
+        is_last = (i == len(st.session_state.chat_history) - 1)
+        if role == "assistant" and is_last and speak_replies:
+            audio_bytes = text_to_speech_bytes(msg)
+            if audio_bytes:
+                st.audio(audio_bytes, format="audio/mp3", autoplay=True)
 
     user_question = st.text_input("Type your question:", value=transcribed_text, key="ai_question_input")
     col_ask, col_clear = st.columns([1, 1])
@@ -875,10 +857,7 @@ with tab_ai:
 
     if ask_clicked and user_question.strip():
         st.session_state.chat_history.append(("user", user_question))
-        if LLM_ENABLED:
-            answer = ask_llm(user_question, context_dict=ctx)
-        else:
-            answer = rule_based_answer(user_question)
+        answer = rule_based_answer(user_question)
         st.session_state.chat_history.append(("assistant", answer))
         st.rerun()
 
@@ -894,6 +873,6 @@ with tab_ai:
     for col, q in zip(cols, sample_qs):
         if col.button(q, use_container_width=True):
             st.session_state.chat_history.append(("user", q))
-            answer = ask_llm(q, context_dict=ctx) if LLM_ENABLED else rule_based_answer(q)
+            answer = rule_based_answer(q)
             st.session_state.chat_history.append(("assistant", answer))
             st.rerun()
