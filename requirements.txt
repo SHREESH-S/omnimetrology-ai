@@ -1,7 +1,6 @@
 streamlit>=1.38
 requests
 beautifulsoup4
-numpy
 pandas
 Pillow
 reportlab
